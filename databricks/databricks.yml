@@ -1,0 +1,58 @@
+bundle:
+  name: ufc-events
+
+# ── Workspace ─────────────────────────────────────────────────────────────────
+# Set DATABRICKS_HOST and DATABRICKS_TOKEN in your environment, or run:
+#   databricks configure
+# to store credentials in ~/.databrickscfg.
+#
+# Replace the host below with your actual workspace URL.
+workspace:
+  host: https://your-workspace.azuredatabricks.net   # ← change this
+
+# ── Variables ─────────────────────────────────────────────────────────────────
+variables:
+  catalog:
+    description: Unity Catalog name
+    default: main
+  schema:
+    description: Schema (database) inside the catalog
+    default: ufc_preview
+
+# ── Include job definitions ───────────────────────────────────────────────────
+include:
+  - resources/*.yml
+
+# ── Deployment targets ────────────────────────────────────────────────────────
+targets:
+
+  # Run with: databricks bundle deploy --target dev
+  # Jobs created in dev get a "[dev <your-name>]" prefix so they don't
+  # collide with the production job.
+  dev:
+    mode: development
+    variables:
+      schema: ufc_preview_dev   # separate schema so dev data stays isolated
+
+  # Run with: databricks bundle deploy --target prod
+  prod:
+    mode: production
+    variables:
+      catalog: main
+      schema:  ufc_preview
+
+# ── Deploy & run cheat-sheet ──────────────────────────────────────────────────
+# Install the CLI:   pip install databricks-cli   (or brew install databricks)
+# Authenticate:      databricks configure
+#
+# First deploy:
+#   databricks bundle deploy --target prod
+#
+# Trigger a manual run right now (useful to seed the DB on day one):
+#   databricks bundle run ufc_weekly_scrape --target prod
+#
+# Check job status in the UI:
+#   Workflows → UFC Weekly Events Scrape
+#
+# Destroy all resources created by this bundle:
+#   databricks bundle destroy --target prod
