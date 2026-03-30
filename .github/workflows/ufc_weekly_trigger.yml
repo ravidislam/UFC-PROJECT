@@ -1,0 +1,69 @@
+name: UFC Weekly Scrape
+
+on:
+  # Runs every Monday at 06:00 UTC
+  schedule:
+    - cron: "0 6 * * 1"
+  # Lets you trigger it manually from the GitHub Actions tab (useful for testing)
+  workflow_dispatch:
+
+jobs:
+  trigger-databricks-notebook:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger notebook run on Databricks
+        # Calls the Databricks "runs/submit" REST API to execute the notebook
+        # on your existing all-purpose cluster (Community Edition requirement —
+        # it does not support new job clusters).
+        run: |
+          RUN_ID=$(curl -s -X POST \
+            "https://${{ secrets.DATABRICKS_HOST }}/api/2.0/jobs/runs/submit" \
+            -H "Authorization: Bearer ${{ secrets.DATABRICKS_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "run_name": "UFC Weekly Scrape",
+              "existing_cluster_id": "${{ secrets.DATABRICKS_CLUSTER_ID }}",
+              "notebook_task": {
+                "notebook_path": "${{ secrets.DATABRICKS_NOTEBOOK_PATH }}",
+                "base_parameters": {
+                  "schema": "ufc_preview"
+                }
+              }
+            }' | python3 -c "import sys,json; print(json.load(sys.stdin)['run_id'])")
+
+          echo "Submitted run ID: $RUN_ID"
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+
+      - name: Wait for notebook to finish
+        # Polls every 30 seconds until the run reaches a terminal state.
+        # Fails the workflow if the notebook errors — so you get an email from GitHub.
+        run: |
+          HOST="https://${{ secrets.DATABRICKS_HOST }}"
+          TOKEN="${{ secrets.DATABRICKS_TOKEN }}"
+
+          for i in $(seq 1 60); do
+            sleep 30
+            RESPONSE=$(curl -s \
+              "$HOST/api/2.0/jobs/runs/get?run_id=$RUN_ID" \
+              -H "Authorization: Bearer $TOKEN")
+
+            STATE=$(echo "$RESPONSE" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin)['state']['life_cycle_state'])")
+            echo "[$i] State: $STATE"
+
+            if [ "$STATE" = "TERMINATED" ]; then
+              RESULT=$(echo "$RESPONSE" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin)['state']['result_state'])")
+              echo "Result: $RESULT"
+              [ "$RESULT" = "SUCCESS" ] && exit 0 || exit 1
+            fi
+
+            if [ "$STATE" = "SKIPPED" ] || [ "$STATE" = "INTERNAL_ERROR" ]; then
+              echo "Run ended unexpectedly: $STATE"
+              exit 1
+            fi
+          done
+
+          echo "Timed out waiting for notebook (>30 min)"
+          exit 1

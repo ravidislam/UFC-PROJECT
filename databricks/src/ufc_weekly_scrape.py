@@ -1,21 +1,21 @@
 # Databricks notebook source
 """
-UFC Weekly Scrape — Databricks Notebook
-========================================
+UFC Weekly Scrape — Databricks Community Edition Notebook
+==========================================================
 Scrapes ALL upcoming UFC events from ufcstats.com and writes fighter + event
-data to Delta Lake tables using MERGE (upsert) so it's safe to re-run weekly
-without creating duplicates.
+data to Delta Lake tables using MERGE (upsert) — safe to re-run weekly.
 
-Scheduled via Databricks Jobs: every Monday at 06:00 (see ../resources/ufc_job.yml).
+Compatible with Databricks Community Edition:
+  - Uses a single schema (no Unity Catalog / 3-level namespace)
+  - Tables live in the Hive metastore under the schema set by the widget below
+  - Scheduled via GitHub Actions (see .github/workflows/ufc_weekly_trigger.yml)
+    because Community Edition does not include the Jobs / Workflows feature
 
 Tables written
 --------------
-  {catalog}.{schema}.events    — one row per UFC card
-  {catalog}.{schema}.fighters  — one row per fighter, updated each scrape
-  {catalog}.{schema}.fights    — one row per bout (links fighters to an event)
-
-All three tables use Delta Lake with Change Data Feed enabled so you can build
-incremental pipelines downstream.
+  {schema}.events    — one row per UFC card
+  {schema}.fighters  — one row per fighter, updated each scrape
+  {schema}.fights    — one row per bout (links fighters to an event)
 """
 
 # COMMAND ----------
@@ -28,20 +28,19 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
-# ── Widgets (overridden by Databricks Job parameters) ─────────────────────────
-# These act as defaults when running the notebook interactively.
-# The job YAML passes catalog/schema as base_parameters, which override these.
-dbutils.widgets.text("catalog", "main",        "Unity Catalog name")
-dbutils.widgets.text("schema",  "ufc_preview", "Schema / database name")
+# ── Widget ────────────────────────────────────────────────────────────────────
+# Change the default value here if you want a different database name.
+# When triggered by GitHub Actions the value is passed as a job parameter
+# which overrides this default automatically.
+dbutils.widgets.text("schema", "ufc_preview", "Schema / database name")
+SCHEMA = dbutils.widgets.get("schema")
 
-CATALOG = dbutils.widgets.get("catalog")
-SCHEMA  = dbutils.widgets.get("schema")
+EVENTS_TABLE   = f"{SCHEMA}.events"
+FIGHTERS_TABLE = f"{SCHEMA}.fighters"
+FIGHTS_TABLE   = f"{SCHEMA}.fights"
 
-EVENTS_TABLE   = f"{CATALOG}.{SCHEMA}.events"
-FIGHTERS_TABLE = f"{CATALOG}.{SCHEMA}.fighters"
-FIGHTS_TABLE   = f"{CATALOG}.{SCHEMA}.fights"
-
-print(f"Target: {CATALOG}.{SCHEMA}  (three tables: events, fighters, fights)")
+print(f"Target schema: {SCHEMA}")
+print(f"Tables: {EVENTS_TABLE}, {FIGHTERS_TABLE}, {FIGHTS_TABLE}")
 
 # COMMAND ----------
 
@@ -58,9 +57,9 @@ from delta.tables import DeltaTable
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-BASE_URL     = "http://www.ufcstats.com"
-UPCOMING_URL = f"{BASE_URL}/statistics/events/upcoming"
-REQUEST_DELAY = 1.0          # seconds between HTTP requests — be a polite scraper
+BASE_URL      = "http://www.ufcstats.com"
+UPCOMING_URL  = f"{BASE_URL}/statistics/events/upcoming"
+REQUEST_DELAY = 1.0   # seconds between requests — be a polite scraper
 
 HEADERS = {
     "User-Agent": (
@@ -71,16 +70,14 @@ HEADERS = {
 
 # COMMAND ----------
 
-# ── Create schema + Delta tables ──────────────────────────────────────────────
-# CREATE TABLE IF NOT EXISTS is idempotent — safe to run on every execution.
-# We store fighter stats on the fighters table and join via url as the natural key
-# (ufcstats gives every fighter a stable URL we can use as a surrogate key).
+# ── Create database + Delta tables ───────────────────────────────────────────
+# All three statements are idempotent (IF NOT EXISTS) — safe to run every week.
+# Community Edition uses the Hive metastore, so no catalog prefix needed.
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+spark.sql(f"CREATE DATABASE IF NOT EXISTS {SCHEMA}")
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
-    event_id   BIGINT GENERATED ALWAYS AS IDENTITY,
     name       STRING NOT NULL,
     date       STRING NOT NULL,
     location   STRING,
@@ -93,7 +90,6 @@ TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {FIGHTERS_TABLE} (
-    fighter_id          BIGINT GENERATED ALWAYS AS IDENTITY,
     name                STRING NOT NULL,
     nickname            STRING,
     record_wins         INT,
@@ -103,23 +99,20 @@ CREATE TABLE IF NOT EXISTS {FIGHTERS_TABLE} (
     reach_cm            DOUBLE,
     stance              STRING,
     dob                 STRING,
-    -- striking stats (per-fight averages from ufcstats)
-    sig_str_landed_pm   DOUBLE,   -- significant strikes landed per minute
-    sig_str_accuracy    DOUBLE,   -- accuracy as 0.0–1.0
-    sig_str_absorbed_pm DOUBLE,   -- sig strikes absorbed per minute
-    sig_str_defense     DOUBLE,   -- defense rate 0.0–1.0
-    -- grappling stats
-    td_avg              DOUBLE,   -- takedown avg per 15 min
-    td_accuracy         DOUBLE,   -- takedown accuracy 0.0–1.0
-    td_defense          DOUBLE,   -- takedown defense 0.0–1.0
-    sub_avg             DOUBLE,   -- submission attempts per 15 min
-    -- derived finish metrics
+    sig_str_landed_pm   DOUBLE,
+    sig_str_accuracy    DOUBLE,
+    sig_str_absorbed_pm DOUBLE,
+    sig_str_defense     DOUBLE,
+    td_avg              DOUBLE,
+    td_accuracy         DOUBLE,
+    td_defense          DOUBLE,
+    sub_avg             DOUBLE,
     total_fights        INT,
     ko_wins             INT,
     sub_wins            INT,
     dec_wins            INT,
     current_win_streak  INT,
-    url                 STRING NOT NULL,   -- stable ufcstats page URL (natural key)
+    url                 STRING NOT NULL,
     scraped_at          TIMESTAMP
 )
 USING DELTA
@@ -128,32 +121,28 @@ TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {FIGHTS_TABLE} (
-    fight_id        BIGINT GENERATED ALWAYS AS IDENTITY,
-    -- We store URLs instead of IDs so joins work before identity columns resolve
     event_url       STRING NOT NULL,
     fighter1_url    STRING NOT NULL,
     fighter2_url    STRING NOT NULL,
     weight_class    STRING,
-    is_main_event   INT,     -- 1 = main event
-    is_title_fight  INT,     -- 1 = title on the line
-    bout_order      INT,     -- 1 = main event, higher number = earlier on card
-    -- result fields — NULL until the fight is completed
+    is_main_event   INT,
+    is_title_fight  INT,
+    bout_order      INT,
     winner_url      STRING,
-    method          STRING,  -- KO/TKO | SUB | U-DEC | S-DEC | NC
+    method          STRING,
     round           INT,
-    time            STRING,  -- e.g. "4:32"
+    time            STRING,
     scraped_at      TIMESTAMP
 )
 USING DELTA
 TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
 """)
 
-print("Schema and tables ready.")
+print("Database and tables ready.")
 
 # COMMAND ----------
 
 # ── Parsing helpers ───────────────────────────────────────────────────────────
-# Pure functions with no side effects — easy to unit test.
 
 def parse_record(record_str):
     """'25-3-0 (1 NC)' → (25, 3, 0)"""
@@ -214,7 +203,7 @@ def inches_reach_to_cm(s):
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 
 def fetch(url):
-    """GET a URL and return a parsed BeautifulSoup, or None on failure."""
+    """GET a URL and return a BeautifulSoup, or None on failure."""
     try:
         print(f"  GET {url}")
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -230,10 +219,7 @@ def fetch(url):
 # ── Fighter scraper ───────────────────────────────────────────────────────────
 
 def scrape_fighter(url):
-    """
-    Scrape one fighter's ufcstats page.
-    Returns a dict ready for a DataFrame row, or None on failure.
-    """
+    """Scrape one fighter page. Returns a dict or None on failure."""
     soup = fetch(url)
     if not soup:
         return None
@@ -242,11 +228,10 @@ def scrape_fighter(url):
     nn   = soup.select_one(".b-content__Nickname")
     nickname = nn.get_text(strip=True).strip('"') if nn else None
 
-    rec_tag = soup.select_one(".b-content__title-record")
+    rec_tag    = soup.select_one(".b-content__title-record")
     record_str = rec_tag.get_text(strip=True).replace("Record:", "").strip() if rec_tag else "0-0-0"
     wins, losses, draws = parse_record(record_str)
 
-    # ufcstats puts career stats in <li> items with "Label: Value" text
     stats = {}
     for li in soup.select(".b-list__box-list-item"):
         text = li.get_text(separator="|", strip=True)
@@ -254,7 +239,6 @@ def scrape_fighter(url):
             label, _, value = text.partition("|")
             stats[label.strip().lower().rstrip(":")] = value.strip()
 
-    # Win method breakdown from fight history table
     ko_wins = sub_wins = dec_wins = current_streak = 0
     last_result = None
     for row in soup.select(".b-fight-details__table-body tr"):
@@ -310,10 +294,7 @@ def scrape_fighter(url):
 # ── Event scraper ─────────────────────────────────────────────────────────────
 
 def scrape_event(event_url):
-    """
-    Scrape one event page.
-    Returns (event_dict, [fight_dicts], [fighter_dicts]).
-    """
+    """Returns (event_dict, [fight_dicts], [fighter_dicts])."""
     soup = fetch(event_url)
     if not soup:
         return None, [], []
@@ -334,6 +315,10 @@ def scrape_event(event_url):
     except ValueError:
         pass
 
+    print(f"\n{'='*60}")
+    print(f"  {event_name}  |  {event_date}")
+    print(f"{'='*60}")
+
     event_row = {
         "name":       event_name,
         "date":       event_date,
@@ -341,10 +326,6 @@ def scrape_event(event_url):
         "url":        event_url,
         "scraped_at": datetime.utcnow(),
     }
-
-    print(f"\n{'='*60}")
-    print(f"  {event_name}  |  {event_date}")
-    print(f"{'='*60}")
 
     fights   = []
     fighters = []
@@ -396,7 +377,6 @@ def scrape_event(event_url):
 
 
 def get_all_upcoming_event_urls():
-    """Return URLs for every upcoming event on ufcstats."""
     soup = fetch(UPCOMING_URL)
     if not soup:
         return []
@@ -410,14 +390,8 @@ def get_all_upcoming_event_urls():
 # COMMAND ----------
 
 # ── Delta upsert helpers ──────────────────────────────────────────────────────
-# We collect all scraped rows into Python lists, convert to Spark DataFrames,
-# then MERGE into Delta — one bulk write per table rather than row-by-row.
 
 def merge_into(table_name, df, merge_condition):
-    """
-    MERGE source df into an existing Delta table on merge_condition.
-    Falls back to overwrite on first run (table empty, no delta log yet).
-    """
     if DeltaTable.isDeltaTable(spark, table_name):
         (
             DeltaTable.forName(spark, table_name)
@@ -434,9 +408,7 @@ def merge_into(table_name, df, merge_condition):
 def upsert_events(rows):
     if not rows:
         return
-    df = spark.createDataFrame(
-        pd.DataFrame(rows).drop_duplicates(subset=["url"])
-    )
+    df = spark.createDataFrame(pd.DataFrame(rows).drop_duplicates(subset=["url"]))
     merge_into(EVENTS_TABLE, df, "t.url = s.url")
     print(f"  events   → {len(rows)} row(s) upserted")
 
@@ -444,9 +416,7 @@ def upsert_events(rows):
 def upsert_fighters(rows):
     if not rows:
         return
-    df = spark.createDataFrame(
-        pd.DataFrame(rows).drop_duplicates(subset=["url"])
-    )
+    df = spark.createDataFrame(pd.DataFrame(rows).drop_duplicates(subset=["url"]))
     merge_into(FIGHTERS_TABLE, df, "t.url = s.url")
     print(f"  fighters → {len(rows)} row(s) upserted")
 
@@ -460,8 +430,7 @@ def upsert_fights(rows):
         )
     )
     merge_into(
-        FIGHTS_TABLE,
-        df,
+        FIGHTS_TABLE, df,
         "t.event_url = s.event_url "
         "AND t.fighter1_url = s.fighter1_url "
         "AND t.fighter2_url = s.fighter2_url",
@@ -470,14 +439,12 @@ def upsert_fights(rows):
 
 # COMMAND ----------
 
-# ── Main: scrape all upcoming events ─────────────────────────────────────────
+# ── Scrape ────────────────────────────────────────────────────────────────────
 
 event_urls = get_all_upcoming_event_urls()
-print(f"\nFound {len(event_urls)} upcoming event(s)")
+print(f"Found {len(event_urls)} upcoming event(s)\n")
 
-all_events   = []
-all_fights   = []
-all_fighters = []
+all_events, all_fights, all_fighters = [], [], []
 
 for url in event_urls:
     ev, fights, fighters = scrape_event(url)
@@ -491,7 +458,7 @@ print(f"\nScrape complete — events: {len(all_events)}, "
 
 # COMMAND ----------
 
-# ── Write to Delta Lake ───────────────────────────────────────────────────────
+# ── Write to Delta ────────────────────────────────────────────────────────────
 
 print("Writing to Delta tables...")
 upsert_events(all_events)
@@ -501,8 +468,7 @@ print("Done.")
 
 # COMMAND ----------
 
-# ── Summary: upcoming card preview ───────────────────────────────────────────
-# display() renders an interactive table in the Databricks notebook UI.
+# ── Card preview ──────────────────────────────────────────────────────────────
 
 display(spark.sql(f"""
     SELECT
@@ -515,14 +481,12 @@ display(spark.sql(f"""
         f1.name                                            AS fighter_1,
         f1.record_wins || '-' || f1.record_losses          AS f1_record,
         f1.current_win_streak                              AS f1_streak,
-        ROUND(
-            (f1.ko_wins + f1.sub_wins)
+        ROUND((f1.ko_wins + f1.sub_wins)
             / NULLIF(f1.record_wins, 0) * 100, 1)          AS f1_finish_pct,
         f2.name                                            AS fighter_2,
         f2.record_wins || '-' || f2.record_losses          AS f2_record,
         f2.current_win_streak                              AS f2_streak,
-        ROUND(
-            (f2.ko_wins + f2.sub_wins)
+        ROUND((f2.ko_wins + f2.sub_wins)
             / NULLIF(f2.record_wins, 0) * 100, 1)          AS f2_finish_pct
     FROM   {FIGHTS_TABLE}   f
     JOIN   {EVENTS_TABLE}   e  ON e.url = f.event_url
@@ -549,8 +513,7 @@ display(spark.sql(f"""
         ROUND(fi.td_defense * 100, 1)                      AS td_defense_pct
     FROM   {FIGHTS_TABLE}   f
     JOIN   {EVENTS_TABLE}   e  ON e.url = f.event_url
-    JOIN   {FIGHTERS_TABLE} fi
-           ON fi.url IN (f.fighter1_url, f.fighter2_url)
+    JOIN   {FIGHTERS_TABLE} fi ON fi.url IN (f.fighter1_url, f.fighter2_url)
     WHERE  e.date >= current_date()
     ORDER  BY fi.sig_str_landed_pm DESC NULLS LAST
 """))
