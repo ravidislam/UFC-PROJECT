@@ -1,0 +1,57 @@
+resources:
+  jobs:
+    ufc_weekly_scrape:
+      name: UFC Weekly Events Scrape
+
+      # ── Schedule ─────────────────────────────────────────────────────────────
+      # Quartz cron: seconds minutes hours day-of-month month day-of-week year
+      # "0 0 6 ? * MON" = every Monday at 06:00 in the workspace timezone.
+      # Change timezone_id to your local zone (e.g. America/Los_Angeles).
+      schedule:
+        quartz_cron_expression: "0 0 6 ? * MON"
+        timezone_id: America/New_York
+        pause_status: UNPAUSED
+
+      # ── Email alerts ─────────────────────────────────────────────────────────
+      # Uncomment and fill in to get notified on failure.
+      # email_notifications:
+      #   on_failure:
+      #     - your@email.com
+
+      tasks:
+        - task_key: scrape_and_load
+          notebook_task:
+            notebook_path: ../src/ufc_weekly_scrape
+            # These override the dbutils.widgets defaults in the notebook.
+            # Adjust to match your Unity Catalog and schema names.
+            base_parameters:
+              catalog: "main"
+              schema:  "ufc_preview"
+
+          # ── Cluster ────────────────────────────────────────────────────────
+          # A single-node cluster is enough — scraping is network-bound,
+          # not compute-bound.  Databricks Runtime 15.4 LTS includes Delta
+          # Lake and Python 3.11 out of the box.
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id:  "i3.xlarge"     # change to match your cloud provider:
+                                            #   AWS:   i3.xlarge
+                                            #   Azure: Standard_DS3_v2
+                                            #   GCP:   n1-standard-4
+            num_workers: 0                  # single-node (driver only)
+            spark_conf:
+              spark.master:                        "local[*, 4]"
+              spark.databricks.cluster.profile:    "singleNode"
+
+            # ── Auto-termination ────────────────────────────────────────────
+            # Cluster shuts down 10 minutes after the job finishes.
+            autotermination_minutes: 10
+
+            # ── Libraries ───────────────────────────────────────────────────
+            # requests / bs4 / lxml are installed via %pip in the notebook,
+            # but you can also pin them here as cluster libraries if preferred.
+
+      # ── Retry policy ─────────────────────────────────────────────────────────
+      # Retry once after 5 minutes if ufcstats is temporarily unreachable.
+      max_retries: 1
+      min_retry_interval_millis: 300000   # 5 minutes

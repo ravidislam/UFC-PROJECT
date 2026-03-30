@@ -1,0 +1,43 @@
+bundle:
+  name: ufc-events
+
+# ── Community Edition note ────────────────────────────────────────────────────
+# This file is here for reference / future use with a paid Databricks workspace.
+#
+# Community Edition does NOT support:
+#   - Databricks Asset Bundle deploy (databricks bundle deploy)
+#   - Scheduled Jobs / Workflows
+#   - Unity Catalog (3-level namespace: catalog.schema.table)
+#
+# For Community Edition, use the notebook directly:
+#   1. Import databricks/src/ufc_weekly_scrape.py into your workspace
+#   2. Run it manually, or let GitHub Actions trigger it weekly
+#      (see .github/workflows/ufc_weekly_trigger.yml)
+#
+# ── Paid workspace setup (future) ────────────────────────────────────────────
+# If you upgrade to a paid workspace, you can deploy with:
+#   pip install databricks-cli
+#   databricks configure       ← enter workspace URL + access token
+#   databricks bundle deploy --target prod
+#   databricks bundle run ufc_weekly_scrape --target prod
+
+workspace:
+  host: https://your-workspace.azuredatabricks.net   # ← change this
+
+variables:
+  schema:
+    description: Schema (database) name
+    default: ufc_preview
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    variables:
+      schema: ufc_preview_dev
+  prod:
+    mode: production
+    variables:
+      schema: ufc_preview
